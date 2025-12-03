@@ -1,0 +1,11 @@
+[package]
+name = "gvi"
+version = "0.1.7"
+edition = "2024"
+
+[dependencies]
+sysinfo = "0.37.0"
+which = "8.0.0"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
