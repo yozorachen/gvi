@@ -19,7 +19,7 @@ struct GvimState {
 // I picked these values off the top of my head
 const MAX_ARGS: usize = 20;
 const MAX_FILES: usize = 30;
-const MAX_SIZE: usize = 1024 * 300;
+const MAX_SIZE: u64 = 1024 * 300;
 
 impl GvimState {
     fn new() -> Self {
@@ -156,35 +156,23 @@ impl App {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn has_large_size_of_files(&self) -> bool {
-        use std::os::unix::fs::MetadataExt;
-
         let mut sum = 0;
         let mut res = false;
 
         self.listed_files.iter().for_each(|f| {
-            sum += f.metadata().unwrap().size();
-            if sum > MAX_SIZE as u64 {
-                res = true
-            };
-        });
+            match std::fs::metadata(f) {
+                Ok(metadata) => {
+                    let size = metadata.len();
 
-        res
-    }
+                    sum += size;
 
-    #[cfg(target_os = "windows")]
-    fn has_large_size_of_files(&self) -> bool {
-        use std::os::windows::fs::MetadataExt;
-
-        let mut sum = 0;
-        let mut res = false;
-
-        self.listed_files.iter().for_each(|f| {
-            sum += f.metadata().unwrap().size();
-            if sum > MAX_SIZE as u64 {
-                res = true
-            };
+                    if sum > MAX_SIZE {
+                        res = true;
+                    }
+                }
+                Err(_) => {}
+            }
         });
 
         res
