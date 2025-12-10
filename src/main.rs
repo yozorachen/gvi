@@ -130,7 +130,7 @@ impl GvimState {
                 }
 
                 // if there is at least single gvim instance, use the instance to open the file.
-                return self.exec_gvim([
+                let res = self.exec_gvim([
                     OsStr::new("--server-name"),
                     OsStr::new("GVIM"),
                     OsStr::new("--remote-tab"),
@@ -138,6 +138,8 @@ impl GvimState {
                 ]);
 
                 std::thread::sleep(std::time::Duration::from_millis(400));
+
+                return res;
             }
             _ => return Ok(()),
         }
