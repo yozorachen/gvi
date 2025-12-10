@@ -1,9 +1,40 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicU64, Ordering::Relaxed},
+};
+
+// millis
+static TIMER: LazyLock<Arc<AtomicU64>> = LazyLock::new(|| Arc::new(AtomicU64::new(0)));
+
+const THRESHOLD_MILLIS: u64 = 2 * 1000;
+
+fn spawn_timer() {
+    const INTERVAL: u64 = 100;
+    std::thread::spawn(|| {
+        loop {
+            TIMER.fetch_add(INTERVAL, Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(INTERVAL as u64));
+        }
+    });
+}
+
+fn init_timer() {
+    set_timer(0);
+}
+
+fn set_timer(v: u64) {
+    TIMER.store(v, Relaxed);
+}
+
+fn get_time() -> u64 {
+    TIMER.load(Relaxed)
+}
 
 #[derive(Default)]
-enum CheckState {
+enum GvimProc {
     #[default]
     NeverChecked,
     CheckedTrue,
@@ -12,7 +43,7 @@ enum CheckState {
 
 #[derive(Default)]
 struct GvimState {
-    is_instance_exists: CheckState,
+    is_instance_exists: GvimProc,
     opened_files: usize,
 }
 
@@ -40,35 +71,18 @@ impl GvimState {
         );
 
         // Let's check if there's already gvim instance or not
-        if let Some((_, proc)) = system
+        if let Some((_, p)) = system
             .processes()
             .iter()
             .find(|(_, p)| p.name() == "gvim" || p.name() == "gvim.exe")
         {
-            // gvim instance was found.
-            //
-            // But right after launching gvim, its server functionality isn't fully up and running
-            // yet, so simply confirming the process has started is NOT enough!
-            //
-            // So, to ensure reliable access to the server functions of the gvim instance,
-            // we need to wait for a moment.
-            //
-            // It's uncertain how long we need to wait because it heavily depends on the host
-            // machine's specs, but 2 or 3 seconds are sufficient in most cases.
-            //
-            // run_time() returns "seconds"
-            let run_millis = proc.run_time() * 1000;
+            let run_millis = p.run_time() * 1000;
 
-            const TIME_TO_START_UP_MILLIS: u64 = 2000;
+            set_timer(run_millis);
 
-            if run_millis < TIME_TO_START_UP_MILLIS {
-                let sleep_millis = TIME_TO_START_UP_MILLIS - run_millis;
-                std::thread::sleep(std::time::Duration::from_millis(sleep_millis));
-            }
-
-            self.is_instance_exists = CheckState::CheckedTrue;
+            self.is_instance_exists = GvimProc::CheckedTrue;
         } else {
-            self.is_instance_exists = CheckState::CheckedFalse;
+            self.is_instance_exists = GvimProc::CheckedFalse;
         }
     }
 
@@ -81,17 +95,40 @@ impl GvimState {
             return Err(AppError::ItemPathNotExist(path.clone()));
         }
 
-        match self.is_instance_exists {
-            CheckState::NeverChecked | CheckState::CheckedFalse => self.process_check(),
-            _ => {}
+        if let GvimProc::NeverChecked = self.is_instance_exists {
+            self.process_check();
         }
 
         match self.is_instance_exists {
-            CheckState::CheckedFalse => {
+            GvimProc::CheckedFalse => {
                 // if there is no gvim instance, create a new process.
-                return self.exec_gvim(&[path]);
+                let res = self.exec_gvim(&[path]);
+
+                init_timer();
+
+                self.is_instance_exists = GvimProc::CheckedTrue;
+
+                return res;
             }
-            CheckState::CheckedTrue => {
+            GvimProc::CheckedTrue => {
+                // gvim instance was found.
+                //
+                // But right after launching gvim, its server functionality isn't fully up and running
+                // yet, so simply confirming the process has started is NOT enough!
+                //
+                // So, to ensure reliable access to the server functions of the gvim instance,
+                // we need to wait for a moment.
+                //
+                // It's uncertain how long we need to wait because it heavily depends on the host
+                // machine's environment, but 2 or 3 seconds are sufficient in most cases.
+
+                let now = get_time();
+                if now < THRESHOLD_MILLIS {
+                    let delta = THRESHOLD_MILLIS - now;
+                    // println!("sleep for {}", delta);
+                    std::thread::sleep(std::time::Duration::from_millis(delta as u64));
+                }
+
                 // if there is at least single gvim instance, use the instance to open the file.
                 return self.exec_gvim([
                     OsStr::new("--server-name"),
@@ -99,6 +136,8 @@ impl GvimState {
                     OsStr::new("--remote-tab"),
                     path.as_ref(),
                 ]);
+
+                std::thread::sleep(std::time::Duration::from_millis(400));
             }
             _ => return Ok(()),
         }
@@ -133,6 +172,8 @@ struct App {
 
 impl App {
     fn new() -> App {
+        spawn_timer();
+
         App {
             args: std::env::args().collect(),
             gvim_state: GvimState::new(),
@@ -160,8 +201,9 @@ impl App {
         let mut sum = 0;
         let mut res = false;
 
-        self.listed_files.iter().for_each(|f| {
-            match std::fs::metadata(f) {
+        self.listed_files
+            .iter()
+            .for_each(|f| match std::fs::metadata(f) {
                 Ok(metadata) => {
                     let size = metadata.len();
 
@@ -172,15 +214,16 @@ impl App {
                     }
                 }
                 Err(_) => {}
-            }
-        });
+            });
 
         res
     }
 
     fn run(&mut self) {
         if !which::which("gvim").unwrap().exists() {
-            eprintln!("Error: It seems you don't have gvim executable. To begin with, please install that.");
+            eprintln!(
+                "Error: It seems you don't have gvim executable. To begin with, please install that."
+            );
             std::process::exit(1);
         }
 
@@ -211,6 +254,8 @@ impl App {
             std::process::exit(1);
         }
 
+        println!("Opening: {:#?}", self.listed_files);
+
         // try to open each file by using gvim.
         for f in self.listed_files.iter() {
             match self.gvim_state.open_single_item(f) {
@@ -223,6 +268,8 @@ impl App {
                 },
             }
         }
+
+        std::process::exit(0);
     }
 }
 
