@@ -145,12 +145,28 @@ impl GvimState {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn exec_gvim<I, S>(&mut self, args: I) -> Result<(), AppError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
         match Command::new("gvim").args(args).spawn() {
+            Ok(_) => {
+                self.increment_opened_files();
+                Ok(())
+            }
+            Err(e) => Err(AppError::CommandSpawnError(e)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exec_gvim<I, S>(&mut self, args: I) -> Result<(), AppError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        match Command::new("gvim").env("GDK_BACKEND", "x11").args(args).spawn() {
             Ok(_) => {
                 self.increment_opened_files();
                 Ok(())
