@@ -12,6 +12,8 @@ const MAX_SIZE: u64 = 1024 * 300;
 impl Gvim {
     const PROCESS_RUNNING_TIME_THRESHOLD_IN_SECS: u64 = 3;
     const GVIM_REUSE_INSTANCE_OPTIONS: [&str; 3] = ["--server-name", "GVIM", "--remote-tab"];
+    #[cfg(target_os = "windows")]
+    const DETACHED_PROCESS: u32 = 0x00000008;
 
     fn new() -> Self {
         Gvim::default()
@@ -41,6 +43,11 @@ impl Gvim {
 
     fn open(&self, normalized_paths: &Vec<PathBuf>) {
         if let Some(running_time) = self.check_process() {
+            // Reuse a existing gvim instance.
+
+            // If no arguments have been supplied, there is nothing to do.
+            if normalized_paths.is_empty() { return }
+
             // Notice: just-launched gvim instance might have no remote functionalities yet.
             // So for such cases we need to "wait" for a moment before the following execution.
             // Not sure how long should we wait for but 3 seconds must be at most sufficient.
@@ -50,6 +57,8 @@ impl Gvim {
 
             self.exec_gvim(Self::GVIM_REUSE_INSTANCE_OPTIONS, normalized_paths);
         } else {
+            // Create a new gvim instance.
+            
             self.exec_gvim([""; 0], normalized_paths);
         }
     }
@@ -61,11 +70,14 @@ impl Gvim {
         T: IntoIterator<Item = U>,
         U: AsRef<std::ffi::OsStr>,
     {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
         {
-            // for i in args {
-            //     println!("{:?}", i.as_ref())
-            // }
+            use std::os::windows::process::CommandExt;
+            Command::new("gvim").args(options).args(args).creation_flags(Self::DETACHED_PROCESS).spawn();
+        }
+
+        #[cfg(target_os = "macos")]
+        {
             Command::new("gvim").args(options).args(args).spawn();
         }
 
@@ -92,14 +104,6 @@ impl App {
             args: std::env::args().collect(),
             gvim: Gvim::new(),
             files: vec![],
-        }
-    }
-
-    fn has_files_to_open(&self) -> bool {
-        if self.args.len() > 1 {
-            return true;
-        } else {
-            return false;
         }
     }
 
@@ -139,11 +143,6 @@ impl App {
     fn run(&mut self) {
         if !which::which("gvim").unwrap().exists() {
             eprintln!("Error: It seems you don't have gvim executable.");
-            std::process::exit(1);
-        }
-
-        // check if theres's one file or more than that
-        if !self.has_files_to_open() {
             std::process::exit(1);
         }
 
