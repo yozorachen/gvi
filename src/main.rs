@@ -1,68 +1,23 @@
-use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{
-    Arc, LazyLock,
-    atomic::{AtomicU64, Ordering::Relaxed},
-};
-
-// millis
-static TIMER: LazyLock<Arc<AtomicU64>> = LazyLock::new(|| Arc::new(AtomicU64::new(0)));
-
-const THRESHOLD_MILLIS: u64 = 2 * 1000;
-
-fn spawn_timer() {
-    const INTERVAL: u64 = 100;
-    std::thread::spawn(|| {
-        loop {
-            TIMER.fetch_add(INTERVAL, Relaxed);
-            std::thread::sleep(std::time::Duration::from_millis(INTERVAL as u64));
-        }
-    });
-}
-
-fn init_timer() {
-    set_timer(0);
-}
-
-fn set_timer(v: u64) {
-    TIMER.store(v, Relaxed);
-}
-
-fn get_time() -> u64 {
-    TIMER.load(Relaxed)
-}
 
 #[derive(Default)]
-enum GvimProc {
-    #[default]
-    NeverChecked,
-    CheckedTrue,
-    CheckedFalse,
-}
-
-#[derive(Default)]
-struct GvimState {
-    is_instance_exists: GvimProc,
-    opened_files: usize,
-}
+struct Gvim();
 
 // I picked these values off the top of my head
 const MAX_ARGS: usize = 20;
 const MAX_FILES: usize = 30;
 const MAX_SIZE: u64 = 1024 * 300;
 
-impl GvimState {
+impl Gvim {
+    const PROCESS_RUNNING_TIME_THRESHOLD_IN_SECS: u64 = 3;
+    const GVIM_REUSE_INSTANCE_OPTIONS: [&str; 3] = ["--server-name", "GVIM", "--remote-tab"];
+
     fn new() -> Self {
-        GvimState::default()
+        Gvim::default()
     }
 
-    fn process_check(&mut self) {
-        // Here, we only need information of processes.
-        // So it's sufficient to initialize the struct without any contents.
-        // Then fill in its process field.
-        // This lazy init will avoid some overhead at start up,
-        // but still, these processes are expensive.
+    fn check_process(&self) -> Option<u64> {
         let mut system = sysinfo::System::new();
 
         system.refresh_specifics(
@@ -76,126 +31,67 @@ impl GvimState {
             .iter()
             .find(|(_, p)| p.name() == "gvim" || p.name() == "gvim.exe")
         {
-            let run_millis = p.run_time() * 1000;
+            let run_secs = p.run_time();
 
-            set_timer(run_millis);
-
-            self.is_instance_exists = GvimProc::CheckedTrue;
+            Some(run_secs)
         } else {
-            self.is_instance_exists = GvimProc::CheckedFalse;
+            None
         }
     }
 
-    fn increment_opened_files(&mut self) {
-        self.opened_files += 1;
-    }
+    fn open(&self, normalized_paths: &Vec<PathBuf>) {
+        if let Some(running_time) = self.check_process() {
+            // Notice: just-launched gvim instance might have no remote functionalities yet.
+            // So for such cases we need to "wait" for a moment before the following execution.
+            // Not sure how long should we wait for but 3 seconds must be at most sufficient.
+            let rest = Self::PROCESS_RUNNING_TIME_THRESHOLD_IN_SECS.saturating_sub(running_time);
 
-    fn open_single_item(&mut self, path: &PathBuf) -> Result<(), AppError> {
-        if !path.exists() {
-            return Err(AppError::ItemPathNotExist(path.clone()));
-        }
+            std::thread::sleep(std::time::Duration::from_secs(rest));
 
-        if let GvimProc::NeverChecked = self.is_instance_exists {
-            self.process_check();
-        }
-
-        match self.is_instance_exists {
-            GvimProc::CheckedFalse => {
-                // if there is no gvim instance, create a new process.
-                let res = self.exec_gvim(&[path]);
-
-                init_timer();
-
-                self.is_instance_exists = GvimProc::CheckedTrue;
-
-                return res;
-            }
-            GvimProc::CheckedTrue => {
-                // gvim instance was found.
-                //
-                // But right after launching gvim, its server functionality isn't fully up and running
-                // yet, so simply confirming the process has started is NOT enough!
-                //
-                // So, to ensure reliable access to the server functions of the gvim instance,
-                // we need to wait for a moment.
-                //
-                // It's uncertain how long we need to wait because it heavily depends on the host
-                // machine's environment, but 2 or 3 seconds are sufficient in most cases.
-
-                let now = get_time();
-                if now < THRESHOLD_MILLIS {
-                    let delta = THRESHOLD_MILLIS - now;
-                    // println!("sleep for {}", delta);
-                    std::thread::sleep(std::time::Duration::from_millis(delta as u64));
-                }
-
-                // if there is at least single gvim instance, use the instance to open the file.
-                let res = self.exec_gvim([
-                    OsStr::new("--server-name"),
-                    OsStr::new("GVIM"),
-                    OsStr::new("--remote-tab"),
-                    path.as_ref(),
-                ]);
-
-                std::thread::sleep(std::time::Duration::from_millis(400));
-
-                return res;
-            }
-            _ => return Ok(()),
+            self.exec_gvim(Self::GVIM_REUSE_INSTANCE_OPTIONS, normalized_paths);
+        } else {
+            self.exec_gvim([""; 0], normalized_paths);
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn exec_gvim<I, S>(&mut self, args: I) -> Result<(), AppError>
+    fn exec_gvim<I, S, T, U>(&self, options: I, args: T)
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
+        T: IntoIterator<Item = U>,
+        U: AsRef<std::ffi::OsStr>,
     {
-        match Command::new("gvim").args(args).spawn() {
-            Ok(_) => {
-                self.increment_opened_files();
-                Ok(())
-            }
-            Err(e) => Err(AppError::CommandSpawnError(e)),
+        #[cfg(not(target_os = "linux"))]
+        {
+            // for i in args {
+            //     println!("{:?}", i.as_ref())
+            // }
+            Command::new("gvim").args(options).args(args).spawn();
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            Command::new("gvim")
+                .env("GDK_BACKEND", "x11")
+                .args(options)
+                .args(args)
+                .spawn();
         }
     }
-
-    #[cfg(target_os = "linux")]
-    fn exec_gvim<I, S>(&mut self, args: I) -> Result<(), AppError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
-    {
-        match Command::new("gvim").env("GDK_BACKEND", "x11").args(args).spawn() {
-            Ok(_) => {
-                self.increment_opened_files();
-                Ok(())
-            }
-            Err(e) => Err(AppError::CommandSpawnError(e)),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum AppError {
-    ItemPathNotExist(PathBuf),
-    CommandSpawnError(std::io::Error),
 }
 
 struct App {
     args: Vec<String>,
-    gvim_state: GvimState,
-    listed_files: Vec<PathBuf>,
+    gvim: Gvim,
+    files: Vec<PathBuf>,
 }
 
 impl App {
     fn new() -> App {
-        spawn_timer();
-
         App {
             args: std::env::args().collect(),
-            gvim_state: GvimState::new(),
-            listed_files: vec![],
+            gvim: Gvim::new(),
+            files: vec![],
         }
     }
 
@@ -219,29 +115,30 @@ impl App {
         let mut sum = 0;
         let mut res = false;
 
-        self.listed_files
-            .iter()
-            .for_each(|f| match std::fs::metadata(f) {
-                Ok(metadata) => {
-                    let size = metadata.len();
+        self.files.iter().for_each(|f| match std::fs::metadata(f) {
+            Ok(metadata) => {
+                let size = metadata.len();
 
-                    sum += size;
+                sum += size;
 
-                    if sum > MAX_SIZE {
-                        res = true;
-                    }
+                if sum > MAX_SIZE {
+                    res = true;
                 }
-                Err(_) => {}
-            });
+            }
+            Err(_) => {}
+        });
 
         res
     }
 
+    fn open(&self) {
+        let files = &self.files;
+        self.gvim.open(&files);
+    }
+
     fn run(&mut self) {
         if !which::which("gvim").unwrap().exists() {
-            eprintln!(
-                "Error: It seems you don't have gvim executable. To begin with, please install that."
-            );
+            eprintln!("Error: It seems you don't have gvim executable.");
             std::process::exit(1);
         }
 
@@ -261,10 +158,23 @@ impl App {
         let mut count: usize = 0;
 
         // expand all the items (including internal ones) if each of them is a directory.
-        self.listed_files = items
+        self.files = items
             .iter()
             .take(MAX_FILES)
-            .flat_map(|item| expand_dir(PathBuf::from(item), &mut count))
+            .filter_map(|item| {
+                let p = PathBuf::from(item);
+
+                // In Windows environment, .canonicalize() returns an abs path with a special prefix \\?\ to express extended-length path.
+                // But seemingly this kind of path doens't work properly for gvim so I don't adopt this method.
+                // match p.canonicalize() {
+                //     Ok(abs_p) => Some(abs_p),
+                //     Err(_) => None
+                // }
+
+                // We decided not to manipulate specified paths.
+                if p.exists() { return Some(p) } else { None }
+            })
+            .flat_map(|p| expand_dir(p, &mut count))
             .collect();
 
         // check if total size of the files is small enough to be acceptable
@@ -272,36 +182,24 @@ impl App {
             std::process::exit(1);
         }
 
-        println!("Opening: {:#?}", self.listed_files);
-
-        // try to open each file by using gvim.
-        for f in self.listed_files.iter() {
-            match self.gvim_state.open_single_item(f) {
-                Ok(_) => {}
-                Err(e) => match e {
-                    AppError::ItemPathNotExist(p) => {
-                        eprintln!("Error: Path: {:?} doesn't exist.", p)
-                    }
-                    AppError::CommandSpawnError(e) => eprintln!("{}", e),
-                },
-            }
-        }
+        self.open();
 
         std::process::exit(0);
     }
 }
 
 // Support recursion
-fn expand_dir(dir: PathBuf, count: &mut usize) -> Vec<PathBuf> {
+fn expand_dir(maybe_dir: PathBuf, count: &mut usize) -> Vec<PathBuf> {
     // if the given argument eventually becomes a file, return the value immediately.
     // is_file will traverse symbolic link.
-    if dir.is_file() {
+    if maybe_dir.is_file() {
+        let file = maybe_dir;
         *count += 1;
-        return vec![dir];
+        return vec![file];
     }
 
     // if the given argument is not readable (i.e. non-directory, lack of permissions) then ignore.
-    let Ok(read_dir) = std::fs::read_dir(dir) else {
+    let Ok(read_dir) = std::fs::read_dir(maybe_dir) else {
         return vec![];
     };
 
@@ -344,14 +242,14 @@ mod tests {
     #[test]
     fn fail_to_open_large_file() {
         let mut app = App::new();
-        app.listed_files = vec![PathBuf::from("tests/test_asset/huge_file.txt")];
+        app.files = vec![PathBuf::from("tests/test_asset/huge_file.txt")];
         assert!(app.has_large_size_of_files());
     }
 
     #[test]
     fn success_to_open_large_file() {
         let mut app = App::new();
-        app.listed_files = vec![PathBuf::from("tests/test_asset/huge_file_but_ok.txt")];
+        app.files = vec![PathBuf::from("tests/test_asset/huge_file_but_ok.txt")];
         assert!(!app.has_large_size_of_files());
     }
 }
