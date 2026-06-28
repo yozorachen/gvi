@@ -46,7 +46,9 @@ impl Gvim {
             // Reuse a existing gvim instance.
 
             // If no arguments have been supplied, there is nothing to do.
-            if normalized_paths.is_empty() { return }
+            if normalized_paths.is_empty() {
+                return;
+            }
 
             // Notice: just-launched gvim instance might have no remote functionalities yet.
             // So for such cases we need to "wait" for a moment before the following execution.
@@ -58,7 +60,7 @@ impl Gvim {
             self.exec_gvim(Self::GVIM_REUSE_INSTANCE_OPTIONS, normalized_paths);
         } else {
             // Create a new gvim instance.
-            
+
             self.exec_gvim([""; 0], normalized_paths);
         }
     }
@@ -73,7 +75,11 @@ impl Gvim {
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
-            Command::new("gvim").args(options).args(args).creation_flags(Self::DETACHED_PROCESS).spawn();
+            Command::new("gvim")
+                .args(options)
+                .args(args)
+                .creation_flags(Self::DETACHED_PROCESS)
+                .spawn();
         }
 
         #[cfg(target_os = "macos")]
